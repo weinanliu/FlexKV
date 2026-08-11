@@ -39,7 +39,10 @@ from flexkv.common.transfer import get_nvtx_range_color, LayerwiseTransferOp
 from flexkv.common.config import (
     CacheConfig, GLOBAL_CONFIG_FROM_ENV, MooncakeTransferEngineConfig, LayerGroupSpec,
 )
-from flexkv.storage.allocator import HugePageTensorHandle, materialize_worker_tensor
+from flexkv.storage.allocator import (
+    HugePageTensorHandle,
+    materialize_worker_tensor,
+)
 from flexkv.transfer.host_buffer import (
     allocate_host_buffer,
     cudaHostRegister,
@@ -128,7 +131,7 @@ class TransferWorkerBase(ABC):
 
     def __init__(self,
                  worker_id: int,
-                 transfer_conn: Connection,  # receive end of pipe
+                 transfer_conn: Optional[Connection],  # receive end of pipe
                  finished_ops_queue: MPQueue,
                  op_buffer_tensor: torch.Tensor):
         self.worker_id = worker_id
@@ -322,8 +325,14 @@ class TransferWorkerBase(ABC):
         return WorkerHandle(worker_id, parent_conn, process, ready_event)
 
     @classmethod
-    def _worker_process(cls, worker_id: int, transfer_conn: Connection, finished_ops_queue: MPQueue,
-                        op_buffer_tensor: torch.Tensor, ready_event: Any, *args: Any, **kwargs: Any) -> None:
+    def _worker_process(cls,
+                        worker_id: int,
+                        transfer_conn: Connection,
+                        finished_ops_queue: MPQueue,
+                        op_buffer_tensor: torch.Tensor,
+                        ready_event: Any,
+                        *args: Any,
+                        **kwargs: Any) -> None:
         # Note: MPI initialization prevention is handled by create_safe_process
         # Environment variables are set before this function is called.
         #
@@ -484,6 +493,8 @@ class TransferWorkerBase(ABC):
         themselves — ``_worker_process`` owns a single ``shutdown()`` in its
         ``finally`` block so cleanup is not duplicated.
         """
+        if self.transfer_conn is None:
+            raise RuntimeError("transfer_conn is required for process-backed workers")
         while True:
             try:
                 if not self.transfer_conn.poll(timeout=0.0001):
@@ -2420,6 +2431,262 @@ class tpGDSTransferWorker(TransferWorkerBase):
         )
 
         return True
+
+
+class RankShardedGDSTransferWorker(TransferWorkerBase):
+    """Rank-sharded GDS transfer worker with one GDSManager per rank."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Optional[Connection],
+        finished_ops_queue: MPQueue,
+        gpu_blocks: List[List[TensorSharedHandle]],
+        gpu_kv_layouts: List[KVCacheLayout],
+        dtype: torch.dtype,
+        ssd_layout: KVCacheLayout,
+        tp_rank__to__file_path: Dict[int, str],
+    ) -> None:
+        """Initialize a serial per-rank GDS transfer worker.
+
+        Rank IDs are derived internally as ``range(tp_group_size)``; no explicit
+        rank parameter is accepted.
+        """
+        if not hasattr(c_ext, "GDSManager"):
+            raise RuntimeError(
+                "RankShardedGDSTransferWorker requires c_ext.GDSManager; build "
+                "with FLEXKV_ENABLE_GDS=1."
+            )
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, None)
+
+        self.ssd_layout = ssd_layout
+        self.tp_group_size = len(tp_rank__to__file_path)
+        self.rank_file_paths = [tp_rank__to__file_path[rank_id] for rank_id in range(self.tp_group_size)]
+        self.num_blocks_per_file = ssd_layout.num_block
+
+        assert len(gpu_blocks) == self.tp_group_size
+        assert len(gpu_kv_layouts) == self.tp_group_size
+        self.num_files = self.tp_group_size
+
+        self.gpu_blocks = []
+        for rank_id, handles_in_one_gpu in enumerate(gpu_blocks):
+            ensure_cuda_device(rank_id)
+            rank_gpu_blocks = import_tensor_handles(handles_in_one_gpu)
+            self.gpu_blocks.append(rank_gpu_blocks)
+
+        self.dtype = dtype
+        self.is_mla = gpu_kv_layouts[0].is_mla
+        self.kv_dim = gpu_kv_layouts[0].kv_dim
+        self.num_layers = gpu_kv_layouts[0].num_layer
+        self.gpu_kv_layouts = gpu_kv_layouts
+
+        reference_layout = gpu_kv_layouts[0]
+        for rank_id, gpu_kv_layout in enumerate(gpu_kv_layouts):
+            assert gpu_kv_layout.layer_groups is None
+            assert gpu_kv_layout.num_layer == self.num_layers
+            assert gpu_kv_layout.tokens_per_block == reference_layout.tokens_per_block
+            assert gpu_kv_layout.kv_dim == self.kv_dim
+            assert len(self.gpu_blocks[rank_id]) in {1, self.num_layers, self.num_layers * self.kv_dim}
+
+        assert ssd_layout.layer_groups is None
+        assert ssd_layout.num_layer == self.num_layers
+        assert ssd_layout.tokens_per_block == reference_layout.tokens_per_block
+        assert ssd_layout.kv_dim == self.kv_dim
+        assert ssd_layout.num_head == reference_layout.num_head
+        assert ssd_layout.head_size == reference_layout.head_size
+
+        self.gds_managers: Dict[int, Any] = {}
+        for rank_id in range(self.tp_group_size):
+            rank_file_path = self.rank_file_paths[rank_id]
+            torch.cuda.set_device(rank_id)
+            gds_manager = c_ext.GDSManager({0: [rank_file_path]}, 1, round_robin=1)
+            if hasattr(gds_manager, "is_ready") and not gds_manager.is_ready():
+                raise RuntimeError(
+                    f"Failed to initialize GDS Manager for rank {rank_id} in worker {worker_id}: "
+                    f"{gds_manager.get_last_error()}"
+                )
+            self.gds_managers[rank_id] = gds_manager
+
+        self.transfer_stream = torch.cuda.Stream()
+
+    def _get_rank_gpu_tensor_slice(
+        self,
+        rank_id: int,
+        block_id: int,
+        layer_id: int,
+        is_v: int,
+    ) -> torch.Tensor:
+        """Return the GPU tensor slice for one rank-file block chunk."""
+        rank_gpu_blocks = self.gpu_blocks[rank_id]
+        num_rank_tensors = len(rank_gpu_blocks)
+        assert num_rank_tensors in {1, self.num_layers, self.num_layers * self.kv_dim}
+        if num_rank_tensors == 1:
+            tensor = rank_gpu_blocks[0]
+        elif num_rank_tensors == self.num_layers:
+            tensor = rank_gpu_blocks[layer_id]
+        else:
+            tensor = rank_gpu_blocks[layer_id * self.kv_dim + is_v]
+
+        layout = self.gpu_kv_layouts[rank_id]
+        offset = (
+            layer_id * layout.get_layer_stride()
+            + is_v * layout.get_kv_stride()
+            + block_id * layout.get_block_stride()
+        )
+        return tensor.view(-1)[offset:offset + layout.get_chunk_size()]
+
+    def _rank_sharded_chunk_offset(
+        self,
+        layer_id: int,
+        is_v: int,
+        blk_id: int,
+    ) -> int:
+        """Return the chunk offset for one rank-file block id.
+
+        ``block_id`` is the offset inside the selected rank file; the same
+        ``block_id`` exists symmetrically in every rank file.
+        """
+        return (
+            layer_id * self.ssd_layout.get_layer_stride()
+            + is_v * self.ssd_layout.get_kv_stride()
+            + blk_id * self.ssd_layout.get_block_stride()
+        )
+
+    def _transfer_impl(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+        **kwargs: Any,
+    ) -> None:
+        """Manually transfer rank-sharded SSD chunks with direct GDS read/write calls."""
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        if transfer_type == TransferType.DISK2D:
+            ssd_block_id_list = src_block_ids
+            gpu_block_id_list = dst_block_ids
+            is_read = True
+        elif transfer_type == TransferType.D2DISK:
+            gpu_block_id_list = src_block_ids
+            ssd_block_id_list = dst_block_ids
+            is_read = False
+        else:
+            raise ValueError(f"Unsupported transfer_type: {transfer_type!r}")
+
+        if len(ssd_block_id_list) == 0:
+            return
+        if len(gpu_block_id_list) != len(ssd_block_id_list):
+            raise ValueError("src_block_ids and dst_block_ids must have the same length")
+
+        for ssd_block_id, gpu_block_id in zip(ssd_block_id_list, gpu_block_id_list):
+            if isinstance(ssd_block_id, torch.Tensor):
+                ssd_block_id_int = int(ssd_block_id.item())
+            else:
+                ssd_block_id_int = int(ssd_block_id)
+            if ssd_block_id_int < 0 or ssd_block_id_int >= self.num_blocks_per_file:
+                raise ValueError(
+                    f"SSD block_id {ssd_block_id_int} out of range [0, {self.num_blocks_per_file})"
+                )
+
+            if isinstance(gpu_block_id, torch.Tensor):
+                gpu_block_id_int = int(gpu_block_id.item())
+            else:
+                gpu_block_id_int = int(gpu_block_id)
+
+            for rank_id in range(self.tp_group_size):
+                gpu_num_blocks = self.gpu_kv_layouts[rank_id].num_block
+                if gpu_block_id_int < 0 or gpu_block_id_int >= gpu_num_blocks:
+                    raise ValueError(
+                        f"GPU block_id {gpu_block_id_int} out of range "
+                        f"[0, {gpu_num_blocks}) for rank {rank_id}"
+                    )
+
+                gds_manager = self.gds_managers[rank_id]
+                rank_file_path = self.rank_file_paths[rank_id]
+                for layer_id in range(self.num_layers):
+                    for is_v in range(self.kv_dim):
+                        gpu_tensor_slice = self._get_rank_gpu_tensor_slice(
+                            rank_id,
+                            gpu_block_id_int,
+                            layer_id,
+                            is_v,
+                        )
+                        chunk_offset = self._rank_sharded_chunk_offset(
+                            layer_id,
+                            is_v,
+                            ssd_block_id_int,
+                        )
+                        chunk_offset_bytes = chunk_offset * self.dtype.itemsize
+                        if is_read:
+                            gds_manager.read(
+                                rank_file_path,
+                                gpu_tensor_slice,
+                                chunk_offset_bytes,
+                            )
+                        else:
+                            gds_manager.write(
+                                rank_file_path,
+                                gpu_tensor_slice,
+                                chunk_offset_bytes,
+                            )
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """Launch a rank-sharded GDS transfer operation."""
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        with torch.cuda.stream(self.transfer_stream):
+            start_time = time.time()
+            self._transfer_impl(
+                src_block_ids,
+                dst_block_ids,
+                transfer_op.transfer_type,
+            )
+            end_time = time.time()
+
+        transfer_size = (
+            self.ssd_layout.get_chunk_size()
+            * self.dtype.itemsize
+            * self.num_layers
+            * transfer_op.valid_block_num
+            * self.kv_dim
+        )
+        self._log_transfer_performance(
+            transfer_op,
+            transfer_size,
+            start_time,
+            end_time,
+        )
+        return True
+
+    def submit_transfer(self, op: TransferOp) -> None:
+        """Synchronously execute one transfer op for benchmark compatibility."""
+        worker_op = WorkerTransferOp(op)
+        try:
+            transfer_status = self.launch_transfer(worker_op)
+        except Exception as e:
+            flexkv_logger.error(
+                "[FlexKV-IO] operation=transfer act=complete status=failed "
+                "direction=%s blocks=%d op_id=%d graph_id=%d mode=rank-sharded-gds "
+                "error=%r",
+                worker_op.transfer_type.value,
+                worker_op.valid_block_num,
+                worker_op.transfer_op_id,
+                worker_op.transfer_graph_id,
+                str(e),
+                exc_info=True,
+            )
+            self.finished_ops_queue.put((worker_op.transfer_op_id, False, None))
+            return
+        if transfer_status:
+            self.finished_ops_queue.put((worker_op.transfer_op_id, True, None))
+        else:
+            self.finished_ops_queue.put((worker_op.transfer_op_id, False, None))
+
+    def shutdown(self) -> None:
+        """Release resources held by the in-process rank-sharded GDS worker."""
+        super().shutdown()
 
 
 class NixlTransferWorker(TransferWorkerBase):

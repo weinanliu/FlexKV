@@ -2,7 +2,7 @@ import time
 import json
 import multiprocessing as mp
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Dict, Tuple, Union
 from argparse import ArgumentParser
 from tqdm import tqdm
 import copy
@@ -12,7 +12,7 @@ import torch
 
 from flexkv.common.transfer import TransferOp, TransferType, LayerwiseTransferOp
 from flexkv.transfer.worker import GPUCPUTransferWorker, CPUSSDDiskTransferWorker, WorkerHandle, tpGPUCPUTransferWorker, \
-    GDSTransferWorker, tpGDSTransferWorker
+    GDSTransferWorker, tpGDSTransferWorker, RankShardedGDSTransferWorker
 from flexkv.transfer.layerwise import LayerwiseTransferWorker, build_layerwise_eventfd_socket_path
 from flexkv.storage.allocator import CPUAllocator, GPUAllocator, SSDAllocator
 from flexkv.common.storage import KVCacheLayoutType, KVCacheLayout
@@ -40,6 +40,7 @@ class BenchmarkConfig:
     gpu_layout_type: int = 0
     use_ce_transfer: bool = False
     transfer_num_cta: int = 4
+    rank_sharded_gds: bool = False
 
 def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]:
     config_file = args.config
@@ -62,6 +63,7 @@ def make_configs(args: dict) -> Tuple[ModelConfig, CacheConfig, BenchmarkConfig]
             gpu_layout_type=args.gpu_layout_type,
             use_ce_transfer=args.use_ce,
             transfer_num_cta=args.cta,
+            rank_sharded_gds=getattr(args, "rank_sharded_gds", False),
         )
         cache_config.num_ssd_blocks = max(cache_config.num_ssd_blocks, bench_config.num_blocks_to_transfer)
         return model_config, cache_config, bench_config
@@ -323,6 +325,108 @@ def create_gpu_ssd_worker(
         finished_ops_queue,
     )
 
+def create_rank_sharded_gpu_ssd_worker(
+                  model_config: ModelConfig,
+                  cache_config: CacheConfig,
+                  num_gpu_blocks: int,
+                  gpu_layout_type: int = 0) -> Tuple[RankShardedGDSTransferWorker, mp.Queue]:
+    if cache_config.ssd_cache_dir is None:
+        raise ValueError("SSD cache directory is required for rank-sharded GPU-SSD worker")
+
+    if gpu_layout_type == 0 or gpu_layout_type == 2:
+        layout_type = KVCacheLayoutType.LAYERFIRST
+    elif gpu_layout_type == 1:
+        layout_type = KVCacheLayoutType.BLOCKFIRST
+    else:
+        raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
+
+    if gpu_layout_type == 0:
+        num_chunks = model_config.num_layers
+    elif gpu_layout_type == 1:
+        num_chunks = 1
+    elif gpu_layout_type == 2:
+        num_chunks = model_config.num_layers * 2
+    else:
+        raise ValueError(f"Invalid GPU layout type: {gpu_layout_type}")
+
+    base_gpu_layout = KVCacheLayout(
+        type=layout_type,
+        num_layer=model_config.num_layers,
+        num_block=num_gpu_blocks,
+        tokens_per_block=cache_config.tokens_per_block,
+        num_head=model_config.num_kv_heads,
+        head_size=model_config.head_size,
+        is_mla=model_config.use_mla,
+    )
+    base_ssd_layout = KVCacheLayout(
+        type=GLOBAL_CONFIG_FROM_ENV.ssd_layout_type,
+        num_layer=model_config.num_layers,
+        num_block=cache_config.num_ssd_blocks,
+        tokens_per_block=cache_config.tokens_per_block,
+        num_head=model_config.num_kv_heads,
+        head_size=model_config.head_size,
+        is_mla=model_config.use_mla,
+    )
+    gpu_layout = base_gpu_layout.div_head(model_config.tp_size) if not model_config.use_mla else base_gpu_layout
+    ssd_layout = base_ssd_layout.div_head(model_config.tp_size) if not model_config.use_mla else base_ssd_layout
+
+    gpu_handles = []
+    for rank_id in range(model_config.tp_size):
+        torch.cuda.set_device(rank_id)
+        gpu_handles.append(GPUAllocator.allocate(
+            layout=gpu_layout,
+            dtype=model_config.dtype,
+            num_chunks=num_chunks,
+            device_id=rank_id,
+        ))
+
+    if isinstance(cache_config.ssd_cache_dir, str):
+        ssd_cache_dirs = [cache_config.ssd_cache_dir]
+    else:
+        ssd_cache_dirs = list(cache_config.ssd_cache_dir)
+    if not ssd_cache_dirs:
+        raise ValueError("SSD cache directory list must not be empty")
+
+    tp_rank__to__file_path: Dict[int, str] = {}
+    for rank_id in range(model_config.tp_size):
+        rank_cache_dir = ssd_cache_dirs[rank_id % len(ssd_cache_dirs)]
+        ssd_handle = SSDAllocator.allocate(
+            layout=ssd_layout,
+            dtype=model_config.dtype,
+            num_chunks=1,
+            cache_dir=rank_cache_dir,
+            file_prefix=f"flexkv_rank_sharded_ssd_cache_rank_{rank_id}",
+            max_file_size_gb=GLOBAL_CONFIG_FROM_ENV.max_file_size_gb,
+        )
+        rank_file_list = ssd_handle.get_file_list()
+        if isinstance(rank_file_list, dict):
+            if not rank_file_list or not rank_file_list[0]:
+                raise ValueError(f"SSD allocator for rank {rank_id} did not create a file")
+            rank_file_path = rank_file_list[0][0]
+        else:
+            if len(rank_file_list) != 1:
+                raise ValueError(
+                    f"Expected one SSD file for rank {rank_id}, got {len(rank_file_list)}"
+                )
+            rank_file_path = rank_file_list[0]
+        tp_rank__to__file_path[rank_id] = rank_file_path
+
+    finished_ops_queue = mp.Queue()
+    worker_handle = RankShardedGDSTransferWorker(
+        worker_id=RankShardedGDSTransferWorker._get_worker_id(),
+        transfer_conn=None,
+        finished_ops_queue=finished_ops_queue,
+        gpu_blocks=[handle.get_tensor_handle_list() for handle in gpu_handles],
+        gpu_kv_layouts=[gpu_handles[rank_id].kv_layout for rank_id in range(model_config.tp_size)],
+        dtype=model_config.dtype,
+        ssd_layout=ssd_layout,
+        tp_rank__to__file_path=tp_rank__to__file_path,
+    )
+    return (
+        worker_handle,
+        finished_ops_queue,
+    )
+
 def create_layerwise_worker(
                   model_config: ModelConfig,
                   cache_config: CacheConfig,
@@ -414,7 +518,7 @@ def create_layerwise_worker(
         finished_ops_queue,
     )
 
-def launch_transfer(worker_handle: WorkerHandle,
+def launch_transfer(worker_handle: Union[WorkerHandle, RankShardedGDSTransferWorker],
                     finished_ops_queue: mp.Queue,
                     transfer_op: TransferOp):
     worker_handle.submit_transfer(transfer_op)
@@ -434,6 +538,12 @@ REVERSE_TYPE_MAP = {
 
 def bench_worker(args):
     model_config, cache_config, bench_config = make_configs(args)
+    transfer_type = bench_config.transfer_type
+    if bench_config.rank_sharded_gds and transfer_type not in (TransferType.DISK2D, TransferType.D2DISK):
+        raise ValueError(
+            "rank-sharded GDS benchmark only supports DISK2D/D2DISK transfer types; "
+            f"got {transfer_type.name}"
+        )
     if model_config.tp_size > torch.cuda.device_count():
         raise ValueError(f"TP size {model_config.tp_size} is greater than "
                          f"the number of GPUs {torch.cuda.device_count()}")
@@ -445,7 +555,6 @@ def bench_worker(args):
     else:
         block_counts = [bench_config.num_blocks_to_transfer]
 
-    transfer_type = bench_config.transfer_type
     gpu_layout_type = bench_config.gpu_layout_type
     warmup_round = bench_config.warmup_round
     benchmark_round = bench_config.benchmark_round
@@ -458,7 +567,13 @@ def bench_worker(args):
     if num_layers_to_transfer == -1:
         num_layers_to_transfer = model_config.num_layers
 
-    if transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
+    if bench_config.rank_sharded_gds:
+        if transfer_kv_blocks_gds is None:
+            print("[BENCH] GDS not compiled, skipping DISK2D/D2DISK")
+            return []
+        worker_handle, finished_ops_queue = create_rank_sharded_gpu_ssd_worker(
+            model_config, cache_config, max_blocks, gpu_layout_type)
+    elif transfer_type == TransferType.H2D or transfer_type == TransferType.D2H:
         worker_handle, finished_ops_queue = create_cpu_gpu_worker(
             model_config, cache_config, max_blocks,
             gpu_layout_type, bench_config.use_ce_transfer,
@@ -607,6 +722,9 @@ def parse_args():
                         default=0,
                         choices=[0, 1, 2],
                         help="GPU KV cache layout type")
+    parser.add_argument("--rank-sharded-gds",
+                        action="store_true",
+                        help="Use rank-sharded GPU-SSD worker for DISK2D/D2DISK")
     parser.add_argument("--use-ce",
                         action="store_true",
                         help="Use CE (cudaMemcpyAsync) transfer path instead of CUDA kernel")
