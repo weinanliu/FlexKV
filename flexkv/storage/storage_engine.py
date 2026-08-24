@@ -12,10 +12,12 @@ from flexkv.common.storage import StorageHandle, KVCacheLayout, KVCacheLayoutTyp
 from flexkv.common.transfer import DeviceType
 from flexkv.storage.allocator import (
     CPUAllocator,
+    RankShardedCPUAllocator,
     GPUAllocator,
     HugePageAllocator,
     RemoteAllocator,
     SSDAllocator,
+    RankShardedSSDAllocator,
 )
 
 
@@ -39,6 +41,9 @@ def _resolve_layer_groups(
 
 class StorageEngine:
     def _cpu_allocator(self) -> type[CPUAllocator] | type[HugePageAllocator]:
+        import os
+        if bool(int(os.getenv("FLEXKV_RANK_SHARDED_GDS", "0"))):
+            return RankShardedCPUAllocator
         if self._cache_config.use_hugepage_cpu_buffer:
             return HugePageAllocator
         return CPUAllocator
@@ -395,7 +400,15 @@ class StorageEngine:
         elif device_type == DeviceType.SSD:
             cache_dir = kwargs.get('cache_dir')
             max_file_size_gb = kwargs.get('max_file_size_gb', -1)
-            if raw_data is not None:
+
+            import os
+            if bool(int(os.getenv("FLEXKV_RANK_SHARDED_GDS", "0"))):
+                storage_handle = RankShardedSSDAllocator.allocate(
+                    layout=layout,
+                    dtype=dtype,
+                    cache_dirs=cache_dir,
+                )
+            elif raw_data is not None:
                 assert isinstance(raw_data, str) or \
                     (isinstance(raw_data, list) and all(isinstance(x, str) for x in raw_data)), \
                     "raw_data for SSDAllocator must be str or List[str]"

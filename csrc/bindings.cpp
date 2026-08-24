@@ -20,6 +20,9 @@
 #include "cache_utils.h"
 #include "gds/gds_manager.h"
 #include "gds/tp_gds_transfer_thread_group.h"
+#ifdef FLEXKV_ENABLE_GDS
+#include "rank_sharded_gds_transfer_worker.h"
+#endif
 #include "pcfs/pcfs.h"
 #include "radix_tree.h"
 #include "tp_transfer_thread_group.h"
@@ -874,6 +877,24 @@ PYBIND11_MODULE(c_ext, m) {
            py::arg("is_read"), py::arg("layer_id"),
            py::arg("layer_granularity"), py::arg("kv_dim"),
            py::arg("num_kv_heads") = 1);
+
+  py::class_<flexkv::RankShardedGDSTransferWorker>(
+      m, "RankShardedGDSTransferWorker")
+      .def(py::init<int, int, int, int,
+                    std::vector<int64_t>, size_t,
+                    bool, bool, int64_t, bool, int, bool, int, bool,
+                    std::vector<std::string>, size_t, int, int,
+                    size_t, size_t, size_t,
+                    const std::vector<int64_t> &, int, size_t,
+                    size_t, size_t, size_t, size_t>())
+      .def("gds_transfer",
+           &flexkv::RankShardedGDSTransferWorker::gds_transfer,
+           py::arg("gpu_block_id_tensor"), py::arg("ssd_block_id_tensor"),
+           py::arg("is_read"))
+      .def("dram_ssd_transfer",
+           &flexkv::RankShardedGDSTransferWorker::dram_ssd_transfer)
+      .def("host_dev_transfer",
+           &flexkv::RankShardedGDSTransferWorker::host_dev_transfer);
 #endif
 
   // Add Hasher class binding

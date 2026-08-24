@@ -39,6 +39,7 @@ from flexkv.transfer.worker import (
     tpGPUCPUTransferWorker,
     GDSTransferWorker,
     tpGDSTransferWorker,
+    RankShardedGDSTransferWorker,
     NixlTransferWorker,
     PEER2CPUTransferWorker,
     MooncakeStoreTransferWorker,
@@ -210,6 +211,24 @@ class TransferEngine:
         self._has_swa = (swa_gpu_handles is not None and len(swa_gpu_handles) > 0
                          and swa_cpu_handle is not None)
         self._cache_config = cache_config
+        rank_sharded_gds = bool(int(os.getenv("FLEXKV_RANK_SHARDED_GDS", "0")))
+        self._rank_sharded_gds = rank_sharded_gds
+        if self._rank_sharded_gds:
+            if self.cache_config.enable_ssd:
+                assert self.cache_config.enable_gds
+            assert model_config.pp_size == 1
+            if model_config.dp_size > 1 or model_config.instance_num > 1:
+                raise ValueError(
+                    "rank_sharded_gds does not support server-client mode "
+                    f"(dp_size={model_config.dp_size}, "
+                    f"instance_num={model_config.instance_num})"
+                )
+            if model_config.nnodes_per_tp_group > 1:
+                raise ValueError(
+                    "rank_sharded_gds does not support cross-node TP "
+                    f"(nnodes_per_tp_group={model_config.nnodes_per_tp_group})"
+                )
+
         # TODO: is this correct?
         self._enable_pcfs_sharing = (
             GLOBAL_CONFIG_FROM_ENV.index_accel and cache_config.enable_kv_sharing
@@ -454,7 +473,21 @@ class TransferEngine:
         
         # H2D worker
         if not _enable_layerwise:
-            if self.model_config.effective_tp_size_per_node == 1:
+            if self._rank_sharded_gds:
+                self.h2d_workers: Dict[WorkerKey, WorkerHandle] = {
+                    worker_key: RankShardedGDSTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        dtype=gpu_handles[0].dtype,
+                        cpu_blocks=self._cpu_handle.get_tensor_list(),
+                        cpu_layout=self._cpu_handle.kv_layout,
+                        gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
+                        gpu_layout=gpu_handles[0].kv_layout,
+                    )
+                    for worker_key, gpu_handles in self.gpu_handle_groups.items()
+                }
+            elif self.model_config.effective_tp_size_per_node == 1:
                 self.h2d_workers: Dict[WorkerKey, WorkerHandle] = {
                     worker_key: GPUCPUTransferWorker.create_worker(
                         mp_ctx=self.mp_ctx,
@@ -499,7 +532,21 @@ class TransferEngine:
             self._worker_map[TransferType.H2D] = self.h2d_workers
 
         # D2H worker
-        if self.model_config.effective_tp_size_per_node == 1:
+        if self._rank_sharded_gds:
+            self.d2h_workers: Dict[WorkerKey, WorkerHandle] = {
+                worker_key: RankShardedGDSTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor=self.pin_buffer.get_buffer(),
+                    dtype=gpu_handles[0].dtype,
+                    cpu_blocks=self._cpu_handle.get_tensor_list(),
+                    cpu_layout=self._cpu_handle.kv_layout,
+                    gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
+                    gpu_layout=gpu_handles[0].kv_layout,
+                )
+                for worker_key, gpu_handles in self.gpu_handle_groups.items()
+            }
+        elif self.model_config.effective_tp_size_per_node == 1:
             self.d2h_workers: Dict[WorkerKey, WorkerHandle] = {
                 worker_key: GPUCPUTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
@@ -546,7 +593,19 @@ class TransferEngine:
         if self._ssd_handle is not None and self._cpu_handle is not None:
             ssd_layer_groups = self.model_config.layer_groups
             # DISK2H worker
-            if not _enable_layerwise:
+            if self._rank_sharded_gds:
+                self.cpussd_read_worker: WorkerHandle = RankShardedGDSTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor = self.pin_buffer.get_buffer(),
+                    dtype=self._cpu_handle.dtype,
+                    cpu_blocks=self._cpu_handle.get_tensor_list(),
+                    cpu_layout=self._cpu_handle.kv_layout,
+                    ssd_layout=self._ssd_handle.kv_layout,
+                    tp_rank__to__file_path=self._ssd_handle.get_file_list(),
+                )
+                self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
+            elif not _enable_layerwise:
                 self.cpussd_read_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
                     mp_ctx=self.mp_ctx,
                     finished_ops_queue=self.finished_ops_queue,
@@ -564,20 +623,32 @@ class TransferEngine:
                 self._worker_map[TransferType.DISK2H] = self.cpussd_read_worker
 
             # H2DISK worker
-            self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
-                mp_ctx=self.mp_ctx,
-                finished_ops_queue=self.finished_ops_queue,
-                op_buffer_tensor = self.pin_buffer.get_buffer(),
-                cpu_blocks=self._cpu_handle.get_worker_tensor(),
-                ssd_files=self._ssd_handle.get_file_list(),
-                cpu_kv_layout=self._cpu_handle.kv_layout,
-                ssd_kv_layout=self._ssd_handle.kv_layout,
-                dtype=self._cpu_handle.dtype,
-                num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
-                cache_config=self._cache_config,
-                compressor=self._compressors["cpu_ssd"],
-                layer_groups=ssd_layer_groups,
-            )
+            if self._rank_sharded_gds:
+                self.cpussd_write_worker: WorkerHandle = RankShardedGDSTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor = self.pin_buffer.get_buffer(),
+                    dtype=self._cpu_handle.dtype,
+                    cpu_blocks=self._cpu_handle.get_tensor_list(),
+                    cpu_layout=self._cpu_handle.kv_layout,
+                    ssd_layout=self._ssd_handle.kv_layout,
+                    tp_rank__to__file_path=self._ssd_handle.get_file_list(),
+                )
+            else:
+                self.cpussd_write_worker: WorkerHandle = CPUSSDDiskTransferWorker.create_worker(
+                    mp_ctx=self.mp_ctx,
+                    finished_ops_queue=self.finished_ops_queue,
+                    op_buffer_tensor = self.pin_buffer.get_buffer(),
+                    cpu_blocks=self._cpu_handle.get_worker_tensor(),
+                    ssd_files=self._ssd_handle.get_file_list(),
+                    cpu_kv_layout=self._cpu_handle.kv_layout,
+                    ssd_kv_layout=self._ssd_handle.kv_layout,
+                    dtype=self._cpu_handle.dtype,
+                    num_blocks_per_file=self._ssd_handle.num_blocks_per_file,
+                    cache_config=self._cache_config,
+                    compressor=self._compressors["cpu_ssd"],
+                    layer_groups=ssd_layer_groups,
+                )
             self._worker_map[TransferType.H2DISK] = self.cpussd_write_worker
         if self._remote_handle is not None and self._cpu_handle is not None:
             self.remotecpu_read_worker: WorkerHandle = CPURemoteTransferWorker.create_worker(
@@ -621,9 +692,28 @@ class TransferEngine:
             self._worker_map[TransferType.REMOTE2H] = self.mooncake_store_worker
             flexkv_logger.info(
                 "[TransferEngine] mooncake-store workers created for H2REMOTE/REMOTE2H")
+
         if self.cache_config.enable_gds:
             assert self._ssd_handle is not None
-            if self.cache_config.enable_nixl:
+
+            if self._rank_sharded_gds:
+
+                self.gds_workers: Dict[WorkerKey, WorkerHandle] = {
+                    worker_key: RankShardedGDSTransferWorker.create_worker(
+                        mp_ctx=self.mp_ctx,
+                        finished_ops_queue=self.finished_ops_queue,
+                        op_buffer_tensor=self.pin_buffer.get_buffer(),
+                        dtype=self._cpu_handle.dtype,
+                        gpu_blocks=[gpu_handle.get_tensor_handle_list() for gpu_handle in gpu_handles],
+                        gpu_layout=gpu_handles[0].kv_layout,
+                        ssd_layout=self._ssd_handle.kv_layout,
+                        tp_rank__to__file_path=self._ssd_handle.get_file_list(),
+                    )
+                    for worker_key, gpu_handles in self.gpu_handle_groups.items()
+                }
+                self._worker_map[TransferType.DISK2D] = self.gds_workers
+                self._worker_map[TransferType.D2DISK] = self.gds_workers
+            elif self.cache_config.enable_nixl:
                 flexkv_logger.info(
                     "[transfer_engine] GDS path using NixlTransferWorker (NIXL GDS_MT)"
                 )

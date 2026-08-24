@@ -909,6 +909,10 @@ class GlobalCacheEngine:
         self.model_config = model_config
         self.tokens_per_block = cache_config.tokens_per_block
 
+        import os
+        self.only_put_to_nvme = bool(int(os.getenv("FLEXKV_ONLY_PUT_TO_NVME", "0")))
+        self.use_mem_as_staging_on_load = bool(int(os.getenv("FLEXKV_USE_MEM_AS_STAGING_ON_LOAD", "0")))
+
         self.cpu_cache_engine = None
         self.ssd_cache_engine = None
         self.remote_cache_engine = None
@@ -1715,6 +1719,182 @@ class GlobalCacheEngine:
             swa_reservation=swa_reservation,
         )
 
+    def _get_impl_local__using_mem_as_staging(self,
+                        request_id: int,
+                        sequence_meta: SequenceMeta,
+                        block_mask_start: int,
+                        block_mask_end: int,
+                        gpu_block_ids: np.ndarray,
+                        temp_cache_strategy: CacheStrategy,
+                        dp_client_id: int,
+                        swa_aware: bool = False) \
+                            -> GetTransferPlan:
+        nvtx_range = nvtx.start_range(message=f"CacheEngine.get_impl_local[{request_id}]", color="cyan")
+        enable_gpu = not temp_cache_strategy.ignore_gpu
+        enable_cpu = self.cache_config.enable_cpu
+        enable_ssd = self.cache_config.enable_ssd and not temp_cache_strategy.ignore_ssd
+        enable_gds = self.cache_config.enable_gds and not temp_cache_strategy.ignore_gds
+        assert enable_cpu and enable_ssd
+        assert self.cpu_cache_engine is not None
+
+        if self.index_accel:
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(
+                sequence_meta, temp_cache_strategy, is_put=False, gpu_matched_blocks=block_mask_start)
+        else:
+            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta, temp_cache_strategy)
+
+        transfer_graph = TransferOpGraph()
+        swa_reservation: Optional[SWAReadReservation] = None
+        assert swa_aware is False
+
+        # DEBUG: Log GET operation with hash info
+        #if len(sequence_meta.block_hashes) > 0:
+        #    print(f"[GET {request_id}] hash[0]={sequence_meta.block_hashes[0]}, "
+        #          f"CPU={cpu_matched_result.num_matched_blocks}/{cpu_matched_result.num_ready_matched_blocks}, "
+        #          f"SSD={ssd_matched_result.num_matched_blocks}/{ssd_matched_result.num_ready_matched_blocks}, "
+        #          f"pos_CPU={cpu_matched_result.matched_pos}, pos_SSD={ssd_matched_result.matched_pos}")
+
+        # tailor the blocks to assure:
+        # the blocks are needed by the mask & the blocks are ready
+        cpu_matched_blocks = cpu_matched_result.physical_blocks[:cpu_matched_result.num_ready_matched_blocks]
+        cpu_matched_blocks = cpu_matched_blocks[block_mask_start:block_mask_end]
+        # if ssd disabled, len(ssd_physical_blocks) is 0
+        ssd_matched_blocks = ssd_matched_result.physical_blocks[:ssd_matched_result.num_ready_matched_blocks]
+        ssd_matched_blocks = ssd_matched_blocks[block_mask_start:block_mask_end]
+
+        # TODO: is this possible?
+        if len(cpu_matched_blocks) > len(ssd_matched_blocks):
+            ssd_matched_blocks = np.array([], dtype=np.int64)
+
+        fragment12_num_blocks = max(len(cpu_matched_blocks), len(ssd_matched_blocks))
+        fragment1_num_blocks = len(cpu_matched_blocks)
+        fragment2_num_blocks = max(len(ssd_matched_blocks) - len(cpu_matched_blocks), 0)
+        #early return if no blocks to transfer
+
+        if fragment12_num_blocks == 0:
+            self._release_swa_read_reservation(swa_reservation)
+            # All cache levels missed - record miss for all requested blocks
+            if self._metrics_collector is not None:
+                total_query_blocks = block_mask_end - block_mask_start
+                if total_query_blocks > 0:
+                    self._metrics_collector.record_cache_miss(total_query_blocks)
+            nvtx.end_range(nvtx_range)
+            return self._empty_get_return(request_id)
+        assert fragment12_num_blocks <= len(gpu_block_ids)
+
+        if 0 < fragment1_num_blocks:
+            print("Warning: CPU cache hit is not expected in local get with mem as staging. ")
+
+        finished_ops_ids = []
+        op_node_to_ready = {}
+
+        fragment12_gpu_blocks = gpu_block_ids[:fragment12_num_blocks]
+        fragment2_ssd_blocks = ssd_matched_blocks[-fragment2_num_blocks:]
+        fragment1_cpu_blocks = cpu_matched_blocks[:fragment1_num_blocks]
+
+        cpu_node_to_unlock = cpu_matched_result.last_ready_node
+        ssd_node_to_unlock = ssd_matched_result.last_ready_node
+
+        # prepare cpu blocks to transfer
+        cpu_blocks_to_free = np.array([], dtype=np.int64)
+        op_disk2h = None
+        op_gds_transfer = None
+        fragment2_cpu_blocks = None
+
+        nr_cpu_buffer_block = fragment2_num_blocks
+        if nr_cpu_buffer_block > 0:
+            nvtx.push_range(f"take {nr_cpu_buffer_block} cpu blocks as staging buffer", color="green")
+            allocated_cpu_blocks = self.cpu_cache_engine.take(
+                num_required_blocks=nr_cpu_buffer_block,
+                protected_node=cpu_matched_result.last_node,
+                strict=False
+            )
+            nvtx.pop_range()
+        else:
+            # take(0) may still trigger proactive eviction at high utilization.
+            allocated_cpu_blocks = np.empty(0, dtype=np.int64)
+        # NOTE: not enough space to allocate, skip the request
+        # there might be a better way to handle this
+        if len(allocated_cpu_blocks) < nr_cpu_buffer_block:
+            self.cpu_cache_engine.recycle(allocated_cpu_blocks)
+            self._release_swa_read_reservation(swa_reservation)
+            # Record allocation failure (resource unavailable, not cache miss)
+            if self._metrics_collector is not None:
+                self._metrics_collector.record_allocation_failure("local")
+            nvtx.end_range(nvtx_range)
+            return self._empty_get_return(request_id)
+
+        # Record cache hit/miss metrics after confirming successful allocation
+        if self._metrics_collector is not None:
+            total_query_blocks = block_mask_end - block_mask_start
+            # CPU hit blocks (directly from CPU cache)
+            self._metrics_collector.record_cache_hit("cpu", fragment1_num_blocks)
+            # SSD hit blocks (loaded directly to GPU with GDS, otherwise via CPU)
+            self._metrics_collector.record_cache_hit("ssd", fragment2_num_blocks)
+            # Miss blocks (not in any cache)
+            miss_blocks = total_query_blocks - fragment12_num_blocks
+            if miss_blocks > 0:
+                self._metrics_collector.record_cache_miss(miss_blocks)
+
+        node_to_unlock = {}
+
+        # 到这里，ssd、cpu命中已知，cpu buffer也分配好了。
+
+        # 先把CPU命中的，倒腾到GPU上去
+        if 0 < fragment1_num_blocks:
+            op_h2d = TransferOp(
+                graph_id = transfer_graph.graph_id,
+                transfer_type = TransferType.H2D,
+                src_block_ids = fragment1_cpu_blocks,
+                dst_block_ids = gpu_block_ids[:fragment1_num_blocks],
+                dp_client_id = dp_client_id,
+            )
+            transfer_graph.add_transfer_op(op_h2d)
+            finished_ops_ids.append(op_h2d.op_id)
+        if cpu_node_to_unlock is not None:
+            node_to_unlock[DeviceType.CPU] = (cpu_node_to_unlock, cpu_node_to_unlock.size())
+
+        # 然后把ssd命中的，先转到CPU buffer上去，再转到GPU上去
+
+        op_disk2h = TransferOp(
+            graph_id = transfer_graph.graph_id,
+            transfer_type = TransferType.DISK2H,
+            src_block_ids = fragment2_ssd_blocks,
+            dst_block_ids = allocated_cpu_blocks,
+            dp_client_id = dp_client_id,
+        )
+
+        op_h2d = TransferOp(
+            graph_id = transfer_graph.graph_id,
+            transfer_type = TransferType.H2D,
+            src_block_ids = allocated_cpu_blocks,
+            dst_block_ids = gpu_block_ids[fragment1_num_blocks:fragment1_num_blocks + fragment2_num_blocks],
+            dp_client_id = dp_client_id,
+        )
+        transfer_graph.add_transfer_op(op_disk2h)
+        transfer_graph.add_transfer_op(op_h2d)
+        transfer_graph.add_dependency(op_h2d.op_id, op_disk2h.op_id)
+        finished_ops_ids.append(op_h2d.op_id)
+
+        if ssd_node_to_unlock is not None:
+            node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+
+        buffer_to_free = {DeviceType.CPU: allocated_cpu_blocks}
+        num_gpu_blocks_to_transfer = len(fragment12_gpu_blocks) if enable_gpu else 0
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+
+        nvtx.end_range(nvtx_range)
+        return GetTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free=buffer_to_free,
+            num_gpu_blocks_to_transfer=num_gpu_blocks_to_transfer,
+            swa_reservation=swa_reservation,
+        )
+    
+
     def _get_impl_local(self,
                         request_id: int,
                         sequence_meta: SequenceMeta,
@@ -1735,6 +1915,15 @@ class GlobalCacheEngine:
         SSD(+peerSSD):     ...      | fragment1 | fragment2      | (uncached)
 
         """
+        if self.use_mem_as_staging_on_load:
+            return self._get_impl_local__using_mem_as_staging(request_id,
+                                                       sequence_meta,
+                                                       block_mask_start,
+                                                       block_mask_end,
+                                                       gpu_block_ids,
+                                                       temp_cache_strategy,
+                                                       dp_client_id,
+                                                       swa_aware)
         nvtx_range = nvtx.start_range(message=f"CacheEngine.get_impl_local[{request_id}]", color="cyan")
         enable_gpu = not temp_cache_strategy.ignore_gpu
         enable_cpu = self.cache_config.enable_cpu
@@ -2485,6 +2674,97 @@ class GlobalCacheEngine:
             swa_slots_to_free=swa_slots_to_free,
         )
 
+    def _put_impl_local_gds_only(self,
+            request_id: int,
+            sequence_meta: SequenceMeta,
+            block_mask_start: int,
+            block_mask_end: int,
+            gpu_block_ids: np.ndarray,
+            temp_cache_strategy: CacheStrategy,
+            dp_client_id: int) \
+                -> PutTransferPlan:
+
+        if self.index_accel:
+            cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta,
+                                                                            temp_cache_strategy=temp_cache_strategy,
+                                                                            is_put=True)
+        else:
+            cpu_matched_result, ssd_matched_result = self.match_local(sequence_meta,
+                                                                      temp_cache_strategy=temp_cache_strategy,
+                                                                      is_put=True)
+        cpu_matched_blocks = cpu_matched_result.physical_blocks[
+            :cpu_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+        ssd_matched_blocks = ssd_matched_result.physical_blocks[
+            :ssd_matched_result.num_matched_blocks][block_mask_start:block_mask_end]
+
+        nr_ssd_hit_blks = len(ssd_matched_blocks)
+        nr_ssd_unhit_blks = len(gpu_block_ids) - nr_ssd_hit_blks
+
+        if nr_ssd_unhit_blks == 0:
+            return self._empty_put_return(request_id)
+
+        src_gpu_blks = gpu_block_ids[nr_ssd_hit_blks:]
+
+        dst_ssd_blks = self.ssd_cache_engine.take(
+            num_required_blocks=nr_ssd_unhit_blks,
+            protected_node = ssd_matched_result.last_node,
+            strict=False
+        )
+
+        if len(dst_ssd_blks) < nr_ssd_unhit_blks:
+            self.ssd_cache_engine.recycle(dst_ssd_blks)
+            return self._empty_put_return(request_id)
+
+        assert self.swa_op_constructor.enabled is False
+
+        transfer_graph = TransferOpGraph()
+        finished_ops_ids = []
+        op_node_to_ready = {}
+
+        op_d2disk = TransferOp(
+            graph_id = transfer_graph.graph_id,
+            transfer_type = TransferType.D2DISK,
+            src_block_ids = src_gpu_blks,
+            dst_block_ids = dst_ssd_blks,
+            dp_client_id = dp_client_id,
+        )
+        flexkv_logger.info(
+            "[FlexKV-SEGV-DEBUG] cache_engine create D2DISK op (local_put) "
+            f"request_id={request_id}, op_id={op_d2disk.op_id}, "
+            f"graph_id={transfer_graph.graph_id}, dp_client_id={dp_client_id}, "
+            f"num_blocks={nr_ssd_unhit_blks}, "
+            f"{summarize_id_tensor('gpu_src', src_gpu_blks)}, "
+            f"{summarize_id_tensor('ssd_dst', dst_ssd_blks)}"
+        )
+        transfer_graph.add_transfer_op(op_d2disk)
+        finished_ops_ids.append(op_d2disk.op_id)
+
+        """insert and lock"""
+        ssd_node_to_unlock = self.ssd_cache_engine.insert(
+            sequence_meta,
+            dst_ssd_blks,
+            is_ready=False,
+            match_result=ssd_matched_result,
+        )
+        op_node_to_ready[op_d2disk.op_id] = (DeviceType.SSD, ssd_node_to_unlock, ssd_node_to_unlock.size())
+        node_to_unlock = {}
+        node_to_unlock[DeviceType.SSD] = (ssd_node_to_unlock, ssd_node_to_unlock.size())
+
+        op_callback_dict = self._build_op_callback_dict(op_node_to_ready)
+
+        skipped_gpu_blocks = nr_ssd_hit_blks
+        swa_slots_to_free = []
+        return PutTransferPlan(
+            transfer_graph=transfer_graph,
+            finished_ops_ids=finished_ops_ids,
+            node_to_unlock=node_to_unlock,
+            op_callback_dict=op_callback_dict,
+            buffer_to_free={},
+            num_gpu_blocks_to_transfer=nr_ssd_unhit_blks,
+            skipped_gpu_blocks=skipped_gpu_blocks,
+            swa_slots_to_free=swa_slots_to_free,
+        )
+        
     def _put_impl_local(self,
             request_id: int,
             sequence_meta: SequenceMeta,
@@ -2511,6 +2791,18 @@ class GlobalCacheEngine:
         assert enable_gpu
         assert enable_cpu
         assert self.cpu_cache_engine is not None
+
+        if self.only_put_to_nvme:
+            assert enable_gds
+            return self._put_impl_local_gds_only(
+                request_id,
+                sequence_meta,
+                block_mask_start,
+                block_mask_end,
+                gpu_block_ids,
+                temp_cache_strategy,
+                dp_client_id,
+            )
 
         if self.index_accel:
             cpu_matched_result, ssd_matched_result = self.match_local_accel(sequence_meta,

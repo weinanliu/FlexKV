@@ -390,11 +390,13 @@ if enable_gds:
     cpp_sources.extend([
         "csrc/gds/gds_manager.cpp",
         "csrc/gds/tp_gds_transfer_thread_group.cpp",
+        "csrc/rank_sharded_gds_transfer_worker.cpp",
         "csrc/gds/layout_transform.cu",
     ])
     hpp_sources.extend([
         "csrc/gds/gds_manager.h",
         "csrc/gds/tp_gds_transfer_thread_group.h",
+        "csrc/rank_sharded_gds_transfer_worker.h",
         "csrc/gds/layout_transform.cuh",
     ])
     extra_link_args.append("-lcufile")

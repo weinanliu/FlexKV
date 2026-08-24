@@ -31,6 +31,13 @@ except ImportError:
     transfer_kv_blocks_gds = None
     TPGDSTransferThreadGroup = None
 
+try:
+    from flexkv.c_ext import (
+        RankShardedGDSTransferWorker as CppRankShardedGDSTransferWorker,
+    )
+except ImportError:
+    CppRankShardedGDSTransferWorker = None
+
 from flexkv.common.debug import flexkv_logger
 from flexkv.common.memory_handle import TensorSharedHandle, release_vmm_tensor
 from flexkv.common.storage import KVCacheLayout, KVCacheLayoutType
@@ -2592,6 +2599,286 @@ class tpGDSTransferWorker(TransferWorkerBase):
         )
 
         return True
+
+
+class RankShardedGDSTransferWorker(TransferWorkerBase):
+    """Rank-sharded GDS transfer worker with one GDSManager per rank."""
+
+    def __init__(
+        self,
+        worker_id: int,
+        transfer_conn: Optional[Connection],
+        finished_ops_queue: MPQueue,
+        op_buffer_tensor,
+        dtype: torch.dtype,
+        cpu_blocks: Union[List[torch.Tensor], List[HugePageTensorHandle]] = [],
+        cpu_layout: Optional[KVCacheLayout] = None,
+        gpu_blocks: List[List[TensorSharedHandle]] = [],
+        gpu_layout: Optional[KVCacheLayout] = None,
+        tp_rank__to__file_path: List[str] = [],
+        ssd_layout: Optional[KVCacheLayout] = None,
+    ) -> None:
+        """Initialize a serial per-rank GDS transfer worker.
+
+        Rank IDs are derived internally as ``range(tp_group_size)``; no explicit
+        rank parameter is accepted.
+        """
+        super().__init__(worker_id, transfer_conn, finished_ops_queue, op_buffer_tensor)
+
+        self._pin_op_buffer()
+        if cpu_layout is not None:
+            cpu_layout = cpu_layout.div_head(cpu_layout.tp_size)
+        if ssd_layout is not None:
+            ssd_layout = ssd_layout.div_head(ssd_layout.tp_size)
+        if gpu_layout is not None:
+            gpu_layout = gpu_layout.div_head(gpu_layout.tp_size)
+
+        # 接下来的layout都是tp rank上的layout
+
+        self.itemsize = dtype.itemsize
+        self.dtype = dtype
+
+        if cpu_layout is not None:
+            self.kv_dim = cpu_layout.kv_dim
+            self.num_layer = cpu_layout.num_layer
+            self.tokens_per_block = cpu_layout.tokens_per_block
+            self.num_head = cpu_layout.num_head
+            self.head_size = cpu_layout.head_size
+            self.num_kv_heads = cpu_layout.num_kv_heads
+            self.tp_size = len(cpu_blocks)
+
+            self.external__kv_stride = cpu_layout.get_kv_stride()
+            self.external__blk_stride = cpu_layout.get_block_stride()
+            self.external__layer_stride = cpu_layout.get_layer_stride()
+            self.chunk_size = cpu_layout.get_chunk_size() # 这里的chunk_size指的是每个tp rank上的chunk size
+        elif ssd_layout is not None:
+            self.kv_dim = ssd_layout.kv_dim
+            self.num_layer = ssd_layout.num_layer
+            self.tokens_per_block = ssd_layout.tokens_per_block
+            self.num_head = ssd_layout.num_head
+            self.head_size = ssd_layout.head_size
+            self.num_kv_heads = ssd_layout.num_kv_heads
+            self.tp_size = len(tp_rank__to__file_path)
+
+            self.external__kv_stride = ssd_layout.get_kv_stride()
+            self.external__blk_stride = ssd_layout.get_block_stride()
+            self.external__layer_stride = ssd_layout.get_layer_stride()
+            self.chunk_size = ssd_layout.get_chunk_size() # 这里的chunk_size指的是每个tp rank上的chunk size
+        elif gpu_layout is not None:
+            self.kv_dim = gpu_layout.kv_dim
+            self.num_layer = gpu_layout.num_layer
+            self.tokens_per_block = gpu_layout.tokens_per_block
+            self.num_head = gpu_layout.num_head
+            self.head_size = gpu_layout.head_size
+            self.num_kv_heads = gpu_layout.num_kv_heads
+            self.tp_size = len(gpu_blocks)
+
+            self.external__kv_stride = 0
+            self.external__blk_stride = 0
+            self.external__layer_stride = 0
+            self.chunk_size = gpu_layout.get_chunk_size() # 这里的chunk_size指的是每个tp rank上的chunk size
+        else:
+            assert False
+
+        assert 0 < self.tp_size
+
+        if cpu_layout is not None:
+            assert cpu_layout.layer_groups is None
+            assert cpu_layout.num_layer == self.num_layer
+            assert cpu_layout.tokens_per_block == self.tokens_per_block
+            assert cpu_layout.kv_dim == self.kv_dim
+            assert cpu_layout.num_head == self.num_head
+            assert cpu_layout.head_size == self.head_size
+            assert len(cpu_blocks) == self.tp_size
+            assert cpu_layout.type == KVCacheLayoutType.BLOCKFIRST
+
+            self.num_cpu_blocks = cpu_layout.num_block
+        else:
+            self.num_cpu_blocks = 0
+
+        cpu_ptrs = [t.data_ptr() for t in cpu_blocks]
+
+        if cpu_layout is not None and gpu_layout is not None:
+            for rank, t in enumerate(cpu_blocks):
+                self._register_host_tensor(t, f"KVCache_tp{rank}")
+
+        self.gpu_blocks = []
+        gpu_block_ptrs_flat: List[int] = []
+        if gpu_layout is not None:
+            assert gpu_layout.layer_groups is None
+            assert gpu_layout.num_layer == self.num_layer
+            assert gpu_layout.tokens_per_block == self.tokens_per_block
+            assert gpu_layout.kv_dim == self.kv_dim
+            assert gpu_layout.num_head == self.num_head
+            assert gpu_layout.head_size == self.head_size
+            assert len(gpu_blocks) == self.tp_size
+
+            for rank_id, handles_in_one_gpu in enumerate(gpu_blocks):
+                rank_gpu_blocks = import_tensor_handles(handles_in_one_gpu)
+                self.gpu_blocks.append(rank_gpu_blocks)
+            rank_tensor_counts = [
+                len(self.gpu_blocks[rank_id])
+                for rank_id in range(self.tp_size)
+            ]
+            if any(count != rank_tensor_counts[0] for count in rank_tensor_counts[1:]):
+                raise ValueError(
+                    "Rank-sharded GDS C++ worker requires uniform tensor counts "
+                    f"across ranks; got {rank_tensor_counts} for {self.tp_size} ranks."
+                )
+
+            for rank_id in range(self.tp_size):
+                for tensor in self.gpu_blocks[rank_id]:
+                    gpu_block_ptrs_flat.append(tensor.data_ptr())
+
+            self.num_gpu_blocks = gpu_layout.num_block
+            num_tensors_per_gpu = rank_tensor_counts[0]
+
+        else:
+            self.num_gpu_blocks = 0
+            num_tensors_per_gpu = 0
+
+
+        if ssd_layout is not None:
+            assert ssd_layout.layer_groups is None
+            assert ssd_layout.num_layer == self.num_layer
+            assert ssd_layout.tokens_per_block == self.tokens_per_block
+            assert ssd_layout.kv_dim == self.kv_dim
+            assert ssd_layout.num_head == self.num_head
+            assert ssd_layout.head_size == self.head_size
+            assert len(tp_rank__to__file_path) == self.tp_size
+            assert ssd_layout.type == KVCacheLayoutType.BLOCKFIRST
+
+            self.num_ssd_blocks = ssd_layout.num_block
+        else:
+            self.num_ssd_blocks = 0
+
+
+        self._cpp_worker = CppRankShardedGDSTransferWorker(
+            self.itemsize,
+            self.kv_dim,
+            self.num_layer,
+            self.num_kv_heads,
+
+            cpu_ptrs,
+            self.num_cpu_blocks,
+
+            GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_h2d,
+            GLOBAL_CONFIG_FROM_ENV.use_ce_transfer_d2h,
+            GLOBAL_CONFIG_FROM_ENV.ce_segment_threshold,
+            GLOBAL_CONFIG_FROM_ENV.ce_path_opt,
+            -1,
+            GLOBAL_CONFIG_FROM_ENV.enable_ce_memcpy2d,
+            GLOBAL_CONFIG_FROM_ENV.ce_gather_threads,
+            GLOBAL_CONFIG_FROM_ENV.ce_gather_nt,
+
+            tp_rank__to__file_path,
+            self.num_ssd_blocks,
+            GLOBAL_CONFIG_FROM_ENV.iouring_entries,
+            GLOBAL_CONFIG_FROM_ENV.iouring_flags,
+
+            self.external__kv_stride,
+            self.external__blk_stride,
+            self.external__layer_stride,
+
+            gpu_block_ptrs_flat,
+            num_tensors_per_gpu,
+            self.num_gpu_blocks,
+
+            gpu_layout.get_kv_stride() if gpu_layout is not None else 0,
+            gpu_layout.get_block_stride() if gpu_layout is not None else 0,
+            gpu_layout.get_layer_stride() if gpu_layout is not None else 0,
+            gpu_layout.get_chunk_size() if gpu_layout is not None else 0,
+        )
+
+    def _transfer_impl(
+        self,
+        src_block_ids: torch.Tensor,
+        dst_block_ids: torch.Tensor,
+        transfer_type: TransferType,
+        **kwargs: Any,
+    ) -> None:
+        """Manually transfer rank-sharded SSD chunks with direct GDS read/write calls."""
+        assert src_block_ids.dtype == torch.int64
+        assert dst_block_ids.dtype == torch.int64
+        assert len(src_block_ids) == len(dst_block_ids)
+
+        if transfer_type == TransferType.DISK2D:
+            gpu_block_ids = dst_block_ids
+            ssd_block_ids = src_block_ids
+            is_read = True
+            self._cpp_worker.gds_transfer(gpu_block_ids, ssd_block_ids, is_read)
+        elif transfer_type == TransferType.D2DISK:
+            gpu_block_ids = src_block_ids
+            ssd_block_ids = dst_block_ids
+            is_read = False
+            self._cpp_worker.gds_transfer(gpu_block_ids, ssd_block_ids, is_read)
+        elif transfer_type == TransferType.DISK2H:
+            layer_id_list = torch.arange(0, self.num_layer, dtype=torch.int32)
+            cpu_block_ids = dst_block_ids
+            ssd_block_ids = src_block_ids
+            is_read = True
+            self._cpp_worker.dram_ssd_transfer(cpu_block_ids, ssd_block_ids,
+                                               layer_id_list, is_read,
+                                               2,
+                                               GLOBAL_CONFIG_FROM_ENV.ssd_io_opt)
+        elif transfer_type == TransferType.H2DISK:
+            layer_id_list = torch.arange(0, self.num_layer, dtype=torch.int32)
+            cpu_block_ids = src_block_ids
+            ssd_block_ids = dst_block_ids
+            is_read = False
+            self._cpp_worker.dram_ssd_transfer(cpu_block_ids, ssd_block_ids,
+                                               layer_id_list, is_read,
+                                               2,
+                                               GLOBAL_CONFIG_FROM_ENV.ssd_io_opt)
+        elif transfer_type == TransferType.D2H:
+            gpu_block_ids = src_block_ids
+            cpu_block_ids = dst_block_ids
+            is_read = False
+            self._cpp_worker.host_dev_transfer(cpu_block_ids, gpu_block_ids, is_read)
+        elif transfer_type == TransferType.H2D:
+            gpu_block_ids = dst_block_ids
+            cpu_block_ids = src_block_ids
+            is_read = True
+            self._cpp_worker.host_dev_transfer(cpu_block_ids, gpu_block_ids, is_read)
+        else:
+            raise ValueError(f"Unsupported transfer_type: {transfer_type!r}")
+
+
+    def launch_transfer(self, transfer_op: WorkerTransferOp) -> bool:
+        """Launch a rank-sharded GDS transfer operation."""
+        src_block_ids, dst_block_ids = self.get_transfer_block_ids(transfer_op)
+
+        start_time = time.time()
+        self._transfer_impl(
+            src_block_ids,
+            dst_block_ids,
+            transfer_op.transfer_type,
+        )
+        end_time = time.time()
+
+        transfer_size = (
+            self.chunk_size
+            * self.itemsize
+            * self.num_layer
+            * transfer_op.valid_block_num
+            * self.kv_dim
+            * self.tp_size
+        )
+        self._log_transfer_performance(
+            transfer_op,
+            transfer_size,
+            start_time,
+            end_time,
+        )
+        return True
+
+    def shutdown(self) -> None:
+        """Release resources held by the in-process rank-sharded GDS worker."""
+        if self._cpp_worker is not None:
+            if hasattr(self._cpp_worker, "shutdown"):
+                self._cpp_worker.shutdown()
+            self._cpp_worker = None
+        super().shutdown()
 
 
 class NixlTransferWorker(TransferWorkerBase):

@@ -132,6 +132,42 @@ class CPUAllocator(BaseStorageAllocator):
             dtype=dtype,
         )
 
+
+class RankShardedCPUAllocator(BaseStorageAllocator):
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 **kwargs: Any) -> StorageHandle:
+        total_size = layout.get_total_elements()
+        assert total_size % layout.tp_size == 0, "total_size must be divisible by tensor_parallel_size"
+
+        flexkv_logger.info(f"Rank-sharded CPU allocate total_size: {dtype.itemsize * total_size/1024/1024/1024} GB")
+        tensors = [torch.empty(
+                            size=(total_size // layout.tp_size,),
+                            dtype=dtype,
+                            device="cpu",
+                            pin_memory=False,)
+                   for _ in range(layout.tp_size)]
+        return StorageHandle(
+            handle_type=AccessHandleType.TENSOR,
+            data=tensors,
+            kv_layout=layout,
+            dtype=dtype,
+        )
+
+    @classmethod
+    def free(cls, accessible_handle: StorageHandle) -> None:
+        pass
+
+    @classmethod
+    def from_raw_data(cls,
+                      data: torch.Tensor,  # type: ignore
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        raise NotImplementedError("RankShardedCPUAllocator does not support from_raw_data")
+
 # ---------------------------------------------------------------------------
 # HugePage helpers (standalone, reusable outside of BaseStorageAllocator)
 # ---------------------------------------------------------------------------
@@ -683,6 +719,48 @@ class SSDAllocator(BaseStorageAllocator):
     def get_file_size_limit(file_path: str) -> int:
         st = os.statvfs(file_path)
         return st.f_frsize * st.f_bavail
+
+class RankShardedSSDAllocator(BaseStorageAllocator):
+    @classmethod
+    def allocate(cls,
+                 layout: KVCacheLayout,
+                 dtype: torch.dtype,
+                 **kwargs: Any) -> StorageHandle:
+        per_rank_layout = layout.div_head(layout.tp_size)
+
+        cache_dirs = kwargs.get("cache_dirs")
+        assert layout.tp_size % len(cache_dirs) == 0
+        nr_gpu_per_ssd = layout.tp_size // len(cache_dirs)
+
+        tp_rank__to__file_path: List[str] = []
+        for rank_id in range(layout.tp_size):
+            rank_cache_dir = cache_dirs[rank_id // nr_gpu_per_ssd]
+            ssd_handle = SSDAllocator.allocate(
+                layout=per_rank_layout,
+                dtype=dtype,
+                cache_dir=rank_cache_dir,
+                file_prefix=f"flexkv_rank_sharded_tp_{rank_id}",
+            )
+            rank_file_list = ssd_handle.get_file_list()
+            assert len(rank_file_list[0]) == 1
+            rank_file_path = rank_file_list[0][0]
+            tp_rank__to__file_path.append(rank_file_path)
+
+        return StorageHandle(
+            handle_type=AccessHandleType.FILE,
+            data=tp_rank__to__file_path,
+            kv_layout=layout,
+            dtype=dtype,
+            num_blocks_per_file=layout.num_block,
+        )
+
+    @classmethod
+    def from_raw_data(cls,
+                      data: Union[str, List[str]],  # type: ignore
+                      layout: KVCacheLayout,
+                      dtype: torch.dtype,
+                      **kwargs: Any) -> StorageHandle:
+        raise NotImplementedError
 
 class RemoteAllocator(BaseStorageAllocator):
     @classmethod
